@@ -1834,6 +1834,554 @@ START_TEST(Async_zombie_request_leftover_at_shutdown) {
 } END_TEST
 #endif /* UA_ENABLE_METHODCALLS */
 
+/* ==== Additional zombie-tracking coverage: gaps found in review ====
+ *
+ * The zombie-tracking tests above cover the path that already works
+ * correctly (processOperationResult() parks a zombie and finalizeZombieOp()
+ * frees it once the worker's late UA_Server_setAsync*Result() call
+ * arrives). The tests below cover call sites that must uphold the exact
+ * same invariant but historically didn't: a synchronous direct-op cancel,
+ * session cancellation, and queue-overflow handling all force-complete an
+ * operation without parking a zombie, so a worker that has not yet
+ * reported is left writing into memory the server may already have freed.
+ * Two more tests cover a reentrancy hazard in the cancellation callback
+ * itself, and the underlying data race between a late worker write and the
+ * server consuming/serializing the result. */
+
+static UA_DataValue *zombieReadPtrB = NULL;
+static UA_StatusCode
+zombieReadCallbackB_async(UA_Server *s, const UA_NodeId *sessionId,
+                         void *sessionContext, const UA_NodeId *nodeId,
+                         void *nodeContext, UA_Boolean includeSourceTimeStamp,
+                         const UA_NumericRange *range, UA_DataValue *value) {
+    zombieReadPtrB = value;
+    return UA_STATUSCODE_GOODCOMPLETESASYNCHRONOUSLY;
+}
+
+START_TEST(Async_zombie_directOp_syncCancel) {
+    /* UA_Server_cancelAsync(..., true) (synchronous result callback) must
+     * park a zombie for a canceled direct operation exactly like the
+     * asynchronous variant does (see Async_zombie_direct_read_lateAck
+     * above) -- it marks the operation CANCELED_WAITING_FOR_WORKER the
+     * same way, so a worker may still be writing into it. */
+    running = false;
+    THREAD_JOIN(server_thread);
+
+    UA_NodeId zombieVar = UA_NODEID_STRING(1, "zombieVarSyncCancel");
+    UA_VariableAttributes attr = UA_VariableAttributes_default;
+    UA_Server_addVariableNode(server, zombieVar,
+                              UA_NODEID_NUMERIC(0, UA_NS0ID_OBJECTSFOLDER),
+                              UA_NODEID_NUMERIC(0, UA_NS0ID_HASCOMPONENT),
+                              UA_QUALIFIEDNAME(1, "zombieVarSyncCancel"),
+                              UA_NODEID_NUMERIC(0, UA_NS0ID_BASEDATAVARIABLETYPE),
+                              attr, NULL, NULL);
+    UA_CallbackValueSource evs = {zombieReadCallback_async, NULL};
+    UA_Server_setVariableNode_callbackValueSource(server, zombieVar, evs);
+
+    zombieReadPtr = NULL;
+    int ctx = 0;
+    UA_ReadValueId rvid;
+    UA_ReadValueId_init(&rvid);
+    rvid.nodeId = zombieVar;
+    rvid.attributeId = UA_ATTRIBUTEID_VALUE;
+
+    UA_StatusCode retval =
+        UA_Server_read_async(server, &rvid, UA_TIMESTAMPSTORETURN_BOTH,
+                             zombieReadNoopCb, &ctx, 5000);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+    ck_assert_ptr_nonnull(zombieReadPtr);
+    lockServer(server);
+    size_t opsCountAfterCreate = server->asyncManager.opsCount;
+    unlockServer(server);
+    ck_assert_uint_eq(opsCountAfterCreate, 1);
+
+    UA_Server_cancelAsync(server, &ctx, UA_STATUSCODE_BADOPERATIONABANDONED, true);
+
+    /* Note: lockServer()/unlockServer() must never straddle a ck_assert --
+     * a failed assertion longjmps out of the test immediately, and a lock
+     * left held that way would corrupt this test's own teardown()
+     * (UA_Server_delete() would hit UA_LOCK_DESTROY's
+     * `assert(lock->count == 0)`) instead of cleanly reporting just this
+     * assertion as failed. Copy values out under the lock, assert after
+     * releasing it -- every test below follows the same rule. */
+    lockServer(server);
+    size_t opsCountAfterCancel = server->asyncManager.opsCount;
+    UA_Boolean zombieOpsEmptyAfterCancel = TAILQ_EMPTY(&server->asyncManager.zombieOps);
+    unlockServer(server);
+    ck_assert_uint_eq(opsCountAfterCancel, 1);
+    ck_assert(!zombieOpsEmptyAfterCancel);
+
+    UA_StatusCode ackRetval = UA_Server_setAsyncReadResult(server, zombieReadPtr);
+    ck_assert_uint_eq(ackRetval, UA_STATUSCODE_GOOD);
+    lockServer(server);
+    size_t opsCountAfterAck = server->asyncManager.opsCount;
+    unlockServer(server);
+    ck_assert_uint_eq(opsCountAfterAck, 0);
+
+    running = true;
+    THREAD_CREATE(server_thread, serverloop);
+} END_TEST
+
+START_TEST(Async_zombie_sessionCancel) {
+    /* UA_AsyncManager_cancelSession() (session cleanup while a request is
+     * in flight) must park a zombie exactly like a CancelRequest does (see
+     * Async_zombie_request_sent_then_lateAck above) -- it force-completes
+     * the operation via the identical UA_AsyncOperation_cancel() call. */
+    UA_NodeId zombieVar = UA_NODEID_STRING(1, "zombieVarSessionCancel");
+    UA_VariableAttributes attr = UA_VariableAttributes_default;
+    UA_Server_addVariableNode(server, zombieVar,
+                              UA_NODEID_NUMERIC(0, UA_NS0ID_OBJECTSFOLDER),
+                              UA_NODEID_NUMERIC(0, UA_NS0ID_HASCOMPONENT),
+                              UA_QUALIFIEDNAME(1, "zombieVarSessionCancel"),
+                              UA_NODEID_NUMERIC(0, UA_NS0ID_BASEDATAVARIABLETYPE),
+                              attr, NULL, NULL);
+    UA_CallbackValueSource evs = {zombieReadCallback_async, NULL};
+    UA_Server_setVariableNode_callbackValueSource(server, zombieVar, evs);
+
+    UA_Client *client = UA_Client_newForUnitTest();
+    UA_Client_getConfig(client)->noReconnect = true;
+    UA_StatusCode retval = UA_Client_connect(client, "opc.tcp://localhost:4840");
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+    running = false;
+    THREAD_JOIN(server_thread);
+
+    UA_ServerConfig *config = UA_Server_getConfig(server);
+    config->serviceNotificationCallback = closeFromAsyncServiceNotification;
+    closeAtServiceAsync = true;
+    closeAtServiceAsyncResult = UA_STATUSCODE_BADUNEXPECTEDERROR;
+    completeCanceledRead = false; /* the "worker" has not reported yet */
+    zombieReadPtr = NULL;
+
+    retval = UA_Client_readValueAttribute_async(
+        client, zombieVar, clientReadCallback, NULL, NULL);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+
+    for(size_t i = 0;
+        i < 20 && closeAtServiceAsyncResult == UA_STATUSCODE_BADUNEXPECTEDERROR;
+        i++) {
+        UA_Server_run_iterate(server, false);
+        UA_Client_run_iterate(client, 0);
+    }
+
+    /* Client cleanup stays at the very end (after the server thread is
+     * running again): UA_Client_disconnect() waits on a CloseSecureChannel
+     * round trip that nothing services while server_thread is stopped for
+     * the manual iteration below. If an assertion between here and the end
+     * of the test fails, the client leaks for this run -- an acceptable
+     * tradeoff over hanging the whole binary. */
+    ck_assert_uint_eq(closeAtServiceAsyncResult, UA_STATUSCODE_GOOD);
+    ck_assert_ptr_nonnull(zombieReadPtr);
+
+    lockServer(server);
+    UA_Boolean waitingOpsEmpty = TAILQ_EMPTY(&server->asyncManager.waitingOps);
+    UA_Boolean zombieOpsEmpty = TAILQ_EMPTY(&server->asyncManager.zombieOps);
+    unlockServer(server);
+    ck_assert(waitingOpsEmpty);
+    ck_assert(!zombieOpsEmpty);
+
+    /* Drain readyResponses so the response is sent. The shared allocation
+     * must survive this, since the zombie above hasn't been acknowledged
+     * yet. */
+    UA_Server_run_iterate(server, false);
+    UA_Server_run_iterate(server, false);
+
+    UA_StatusCode ackRetval = UA_Server_setAsyncReadResult(server, zombieReadPtr);
+    ck_assert_uint_eq(ackRetval, UA_STATUSCODE_GOOD);
+    lockServer(server);
+    UA_Boolean zombieOpsEmptyAfterAck = TAILQ_EMPTY(&server->asyncManager.zombieOps);
+    unlockServer(server);
+    ck_assert(zombieOpsEmptyAfterAck);
+
+    config->serviceNotificationCallback = NULL;
+    running = true;
+    THREAD_CREATE(server_thread, serverloop);
+    UA_Client_disconnect(client);
+    UA_Client_delete(client);
+} END_TEST
+
+START_TEST(Async_zombie_queueOverflow) {
+    /* persistAsyncResponseOperation()'s queue-limit handling must also park
+     * a zombie: it force-completes the operation via
+     * UA_AsyncOperation_cancel() exactly like every other cancellation
+     * path, but historically returned without ever registering it (no
+     * waitingOps entry, no opCountdown/opsCount increment) -- for a
+     * single-operation request, that means the whole service reports
+     * *done* while the operation's own callback has already gone
+     * asynchronous and its worker hasn't reported. */
+    running = false;
+    THREAD_JOIN(server_thread);
+
+    UA_NodeId zombieVarA = UA_NODEID_STRING(1, "zombieVarQueueOverflowA");
+    UA_NodeId zombieVarB = UA_NODEID_STRING(1, "zombieVarQueueOverflowB");
+    UA_VariableAttributes attr = UA_VariableAttributes_default;
+    UA_Server_addVariableNode(server, zombieVarA,
+                              UA_NODEID_NUMERIC(0, UA_NS0ID_OBJECTSFOLDER),
+                              UA_NODEID_NUMERIC(0, UA_NS0ID_HASCOMPONENT),
+                              UA_QUALIFIEDNAME(1, "zombieVarQueueOverflowA"),
+                              UA_NODEID_NUMERIC(0, UA_NS0ID_BASEDATAVARIABLETYPE),
+                              attr, NULL, NULL);
+    UA_CallbackValueSource evsA = {zombieReadCallback_async, NULL};
+    UA_Server_setVariableNode_callbackValueSource(server, zombieVarA, evsA);
+    UA_Server_addVariableNode(server, zombieVarB,
+                              UA_NODEID_NUMERIC(0, UA_NS0ID_OBJECTSFOLDER),
+                              UA_NODEID_NUMERIC(0, UA_NS0ID_HASCOMPONENT),
+                              UA_QUALIFIEDNAME(1, "zombieVarQueueOverflowB"),
+                              UA_NODEID_NUMERIC(0, UA_NS0ID_BASEDATAVARIABLETYPE),
+                              attr, NULL, NULL);
+    UA_CallbackValueSource evsB = {zombieReadCallbackB_async, NULL};
+    UA_Server_setVariableNode_callbackValueSource(server, zombieVarB, evsB);
+
+    UA_ServerConfig *config = UA_Server_getConfig(server);
+    const UA_UInt32 oldLimit = config->maxAsyncOperationQueueSize;
+    config->maxAsyncOperationQueueSize = 1;
+
+    /* Occupy the one available slot with a direct operation that never
+     * self-completes. */
+    zombieReadPtr = NULL;
+    UA_ReadValueId rvidA;
+    UA_ReadValueId_init(&rvidA);
+    rvidA.nodeId = zombieVarA;
+    rvidA.attributeId = UA_ATTRIBUTEID_VALUE;
+    UA_StatusCode retval =
+        UA_Server_read_async(server, &rvidA, UA_TIMESTAMPSTORETURN_BOTH,
+                             zombieReadNoopCb, NULL, 5000);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+    ck_assert_ptr_nonnull(zombieReadPtr);
+    lockServer(server);
+    size_t opsCountAfterA = server->asyncManager.opsCount;
+    unlockServer(server);
+    ck_assert_uint_eq(opsCountAfterA, 1);
+
+    /* A single-node Read request for a second, independent async variable.
+     * Its operation goes async and is then immediately force-cancelled by
+     * the queue limit -- inside the SAME Service_Read() call, before it
+     * ever returns to its caller. */
+    zombieReadPtrB = NULL;
+    UA_ReadValueId rvidB;
+    UA_ReadValueId_init(&rvidB);
+    rvidB.nodeId = zombieVarB;
+    rvidB.attributeId = UA_ATTRIBUTEID_VALUE;
+
+    UA_ReadRequest request;
+    UA_ReadRequest_init(&request);
+    request.timestampsToReturn = UA_TIMESTAMPSTORETURN_NEITHER;
+    request.nodesToRead = &rvidB;
+    request.nodesToReadSize = 1;
+
+    UA_ReadResponse response;
+    UA_ReadResponse_init(&response);
+
+    lockServer(server);
+    UA_Boolean done = Service_Read(server, &server->adminSession, &request, &response);
+    unlockServer(server);
+
+    ck_assert_ptr_nonnull(zombieReadPtrB);
+    ck_assert(response.results[0].hasStatus);
+    ck_assert_uint_eq(response.results[0].status, UA_STATUSCODE_BADTOOMANYOPERATIONS);
+
+    /* A service must not report *done* while one of its operations is
+     * still outstanding from the worker's point of view -- the same way
+     * any other force-cancelled-but-not-yet-acknowledged operation keeps
+     * its response pending. That in turn means the shared allocation must
+     * not be handed back to the caller and cleared synchronously here. */
+    ck_assert(!done);
+
+    lockServer(server);
+    UA_Boolean zombieOpsEmpty = TAILQ_EMPTY(&server->asyncManager.zombieOps);
+    unlockServer(server);
+    ck_assert(!zombieOpsEmpty);
+
+    UA_ReadResponse_clear(&response);
+
+    /* Clean up op A (by design never resolved above) instead of leaving it
+     * to the forced shutdown path. */
+    UA_Server_setAsyncReadResult(server, zombieReadPtr);
+    UA_Server_run_iterate(server, false);
+    UA_Server_run_iterate(server, false);
+
+    config->maxAsyncOperationQueueSize = oldLimit;
+    running = true;
+    THREAD_CREATE(server_thread, serverloop);
+} END_TEST
+
+static UA_Variant zombieLateWriteDeliveredValue;
+static UA_Boolean zombieLateWriteDeliveredValueReceived;
+
+static void
+zombieLateWriteCompletionCb(UA_Server *s, void *ctx, const UA_DataValue *result) {
+    (void)s; (void)ctx;
+    UA_Variant_clear(&zombieLateWriteDeliveredValue);
+    UA_Variant_copy(&result->value, &zombieLateWriteDeliveredValue);
+    zombieLateWriteDeliveredValueReceived = true;
+}
+
+START_TEST(Async_forceCompleted_doesNotDeliverLateWorkerWrite) {
+    /* directOpCallback()/sendAsyncResponse() must not deliver a payload a
+     * worker writes only after the operation was already force-completed
+     * (timeout/cancel) -- the result is already decided as far as the
+     * original caller is concerned. This hand-forces the exact
+     * interleaving a real race would only occasionally produce, so it is
+     * deterministic rather than dependent on OS thread scheduling; compare
+     * Async_stress_workerWriteVsResultConsumption further down, which
+     * exercises the identical code path with a genuine concurrent worker
+     * thread for a race detector to independently confirm. */
+    running = false;
+    THREAD_JOIN(server_thread);
+
+    UA_NodeId zombieVar = UA_NODEID_STRING(1, "zombieVarLateWrite");
+    UA_VariableAttributes attr = UA_VariableAttributes_default;
+    UA_Server_addVariableNode(server, zombieVar,
+                              UA_NODEID_NUMERIC(0, UA_NS0ID_OBJECTSFOLDER),
+                              UA_NODEID_NUMERIC(0, UA_NS0ID_HASCOMPONENT),
+                              UA_QUALIFIEDNAME(1, "zombieVarLateWrite"),
+                              UA_NODEID_NUMERIC(0, UA_NS0ID_BASEDATAVARIABLETYPE),
+                              attr, NULL, NULL);
+    UA_CallbackValueSource evs = {zombieReadCallback_async, NULL};
+    UA_Server_setVariableNode_callbackValueSource(server, zombieVar, evs);
+
+    zombieReadPtr = NULL;
+    int ctx = 0;
+    UA_ReadValueId rvid;
+    UA_ReadValueId_init(&rvid);
+    rvid.nodeId = zombieVar;
+    rvid.attributeId = UA_ATTRIBUTEID_VALUE;
+
+    UA_Variant_init(&zombieLateWriteDeliveredValue);
+    zombieLateWriteDeliveredValueReceived = false;
+
+    UA_StatusCode retval =
+        UA_Server_read_async(server, &rvid, UA_TIMESTAMPSTORETURN_BOTH,
+                             zombieLateWriteCompletionCb, &ctx, 5000);
+    ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+    ck_assert_ptr_nonnull(zombieReadPtr);
+
+    /* Force-complete (mirrors a timeout/cancel). */
+    UA_Server_cancelAsync(server, &ctx, UA_STATUSCODE_BADTIMEOUT, false);
+
+    /* Simulate a worker that, unaware of the cancellation, finishes its
+     * real work and writes its result right at this moment -- strictly
+     * after force-completion, but before the response has actually been
+     * consumed by directOpCallback(). */
+    UA_UInt32 sentinel = 0xDEADBEEF;
+    UA_Variant_setScalarCopy(&zombieReadPtr->value, &sentinel, &UA_TYPES[UA_TYPES_UINT32]);
+
+    UA_Server_run_iterate(server, false);
+    UA_Server_run_iterate(server, false);
+    ck_assert(zombieLateWriteDeliveredValueReceived);
+
+    /* The sentinel -- written strictly after force-completion -- must not
+     * have been delivered to the original caller. */
+    UA_Boolean sentinelLeaked =
+        zombieLateWriteDeliveredValue.type == &UA_TYPES[UA_TYPES_UINT32] &&
+        zombieLateWriteDeliveredValue.data != NULL &&
+        *(UA_UInt32*)zombieLateWriteDeliveredValue.data == sentinel;
+    ck_assert(!sentinelLeaked);
+
+    UA_Variant_clear(&zombieLateWriteDeliveredValue);
+
+    /* Let the "worker" (simulated above) formally acknowledge completion so
+     * the zombie is cleaned up instead of leaking. */
+    UA_Server_setAsyncReadResult(server, zombieReadPtr);
+
+    running = true;
+    THREAD_CREATE(server_thread, serverloop);
+} END_TEST
+
+/* Supplementary to Async_forceCompleted_doesNotDeliverLateWorkerWrite
+ * above: the same finding, but with a genuine concurrent worker thread
+ * instead of a hand-forced interleaving.
+ *
+ * NOTE ON GATING: this test cannot tell you whether the underlying race is
+ * fixed. A data race's *absence* isn't something a single run can prove --
+ * only a race detector attached to a run where the race actually fires can
+ * prove its *presence* -- and this project's default Debug config only
+ * enables ASan/UBSan (see UA_ENABLE_DEBUG_SANITIZER in the top-level
+ * CMakeLists.txt), neither of which detects data races. So under a plain
+ * or ASan build this test passes regardless of whether the code path is
+ * actually safe; treat Async_forceCompleted_doesNotDeliverLateWorkerWrite
+ * above as the real regression test for this finding. Run this one under
+ * ThreadSanitizer (-fsanitize=thread) or
+ * valgrind --tool=helgrind / --tool=drd for independent confirmation. */
+static UA_DataValue *raceOpPtr = NULL;
+
+static UA_StatusCode
+raceReadCallback_async(UA_Server *s, const UA_NodeId *sessionId,
+                       void *sessionContext, const UA_NodeId *nodeId,
+                       void *nodeContext, UA_Boolean includeSourceTimeStamp,
+                       const UA_NumericRange *range, UA_DataValue *value) {
+    raceOpPtr = value;
+    return UA_STATUSCODE_GOODCOMPLETESASYNCHRONOUSLY;
+}
+
+/* Fixed write budget instead of a shared stop flag: a second racy variable
+ * just to coordinate shutdown would compete with (and can mask, since most
+ * race detectors report only the first race found per pair of accesses)
+ * the one race this test exists to surface. */
+THREAD_CALLBACK(raceWorkerLoop) {
+    for(UA_UInt32 counter = 0; counter < 20000; counter++) {
+        UA_Variant_setScalarCopy(&raceOpPtr->value, &counter, &UA_TYPES[UA_TYPES_UINT32]);
+    }
+    return NULL;
+}
+
+static void
+raceReadCompletionCb(UA_Server *s, void *ctx, const UA_DataValue *result) {
+    (void)s; (void)ctx;
+    /* Deliberately not gated on result->hasValue: raceWorkerLoop() only
+     * ever touches the nested UA_Variant (result->value), never the
+     * UA_DataValue's own hasValue flag. */
+    UA_Byte *data = (UA_Byte*)result->value.data;
+    if(data)
+        (void)*(volatile UA_Byte*)data;
+}
+
+START_TEST(Async_stress_workerWriteVsResultConsumption) {
+    running = false;
+    THREAD_JOIN(server_thread);
+
+    UA_NodeId raceVar = UA_NODEID_STRING(1, "raceVar");
+    UA_VariableAttributes attr = UA_VariableAttributes_default;
+    UA_StatusCode res =
+        UA_Server_addVariableNode(server, raceVar,
+                                  UA_NODEID_NUMERIC(0, UA_NS0ID_OBJECTSFOLDER),
+                                  UA_NODEID_NUMERIC(0, UA_NS0ID_HASCOMPONENT),
+                                  UA_QUALIFIEDNAME(1, "raceVar"),
+                                  UA_NS0ID(BASEDATAVARIABLETYPE),
+                                  attr, NULL, NULL);
+    ck_assert_uint_eq(res, UA_STATUSCODE_GOOD);
+    UA_CallbackValueSource evs = {raceReadCallback_async, NULL};
+    UA_Server_setVariableNode_callbackValueSource(server, raceVar, evs);
+
+    UA_ReadValueId rvid;
+    UA_ReadValueId_init(&rvid);
+    rvid.nodeId = raceVar;
+    rvid.attributeId = UA_ATTRIBUTEID_VALUE;
+
+    /* A single create/cancel/drain cycle only has one chance to actually
+     * overlap with the worker thread's writes -- real thread scheduling
+     * does not guarantee that. Repeat the cycle to give a race detector
+     * many independent opportunities to observe the conflicting access. */
+    for(int iter = 0; iter < 200; iter++) {
+        raceOpPtr = NULL;
+        int ctx = 0;
+        UA_StatusCode retval =
+            UA_Server_read_async(server, &rvid, UA_TIMESTAMPSTORETURN_BOTH,
+                                 raceReadCompletionCb, &ctx, 5000);
+        ck_assert_uint_eq(retval, UA_STATUSCODE_GOOD);
+        ck_assert_ptr_nonnull(raceOpPtr);
+
+        THREAD_HANDLE raceWorker;
+        THREAD_CREATE(raceWorker, raceWorkerLoop);
+
+        UA_Server_cancelAsync(server, &ctx, UA_STATUSCODE_BADTIMEOUT, false);
+        UA_Server_run_iterate(server, false);
+        UA_Server_run_iterate(server, false);
+
+        THREAD_JOIN(raceWorker);
+        UA_Server_setAsyncReadResult(server, raceOpPtr);
+    }
+
+    running = true;
+    THREAD_CREATE(server_thread, serverloop);
+} END_TEST
+
+START_TEST(Async_reentrantCancelDuringTimeout_isSafe) {
+    /* UA_AsyncOperation_cancel() invokes the user's
+     * asyncOperationCancelCallback while the operation is still linked in
+     * am->waitingOps for the checkTimeouts()/UA_AsyncManager_cancel()/
+     * UA_AsyncManager_clear() call sites -- unlike
+     * cancelAsyncResponseOperations() and UA_AsyncManager_cancelSession(),
+     * which unlink first specifically to guard against reentrant mutation.
+     * If the callback turns around and calls UA_Server_setAsync*Result()
+     * -- exactly what a worker racing the timeout would do -- that call
+     * must not find the operation still reachable: it must already have
+     * been unlinked before the cancel callback ran. Otherwise the
+     * reentrant call fully processes the operation, control returns to
+     * UA_AsyncOperation_cancel() which marks it CANCELED_WAITING_FOR_WORKER
+     * again, and the outer checkTimeouts() loop processes the SAME
+     * operation a second time -- a double TAILQ_REMOVE (the second one
+     * through stale, already-unlinked pointers), double opsCount--, double
+     * ar->opCountdown--, silently underflowing both (they are unsigned). */
+    running = false;
+    THREAD_JOIN(server_thread);
+
+    UA_NodeId zombieVar = UA_NODEID_STRING(1, "zombieVarReentrantCancel");
+    UA_VariableAttributes attr = UA_VariableAttributes_default;
+    UA_Server_addVariableNode(server, zombieVar,
+                              UA_NODEID_NUMERIC(0, UA_NS0ID_OBJECTSFOLDER),
+                              UA_NODEID_NUMERIC(0, UA_NS0ID_HASCOMPONENT),
+                              UA_QUALIFIEDNAME(1, "zombieVarReentrantCancel"),
+                              UA_NODEID_NUMERIC(0, UA_NS0ID_BASEDATAVARIABLETYPE),
+                              attr, NULL, NULL);
+    UA_CallbackValueSource evs = {zombieReadCallback_async, NULL};
+    UA_Server_setVariableNode_callbackValueSource(server, zombieVar, evs);
+
+    UA_ServerConfig *config = UA_Server_getConfig(server);
+    const UA_Double oldTimeout = config->asyncOperationTimeout;
+    config->asyncOperationTimeout = 50.0; /* well under the 1s checkTimeouts tick */
+
+    zombieReadPtr = NULL;
+    UA_ReadValueId rvid;
+    UA_ReadValueId_init(&rvid);
+    rvid.nodeId = zombieVar;
+    rvid.attributeId = UA_ATTRIBUTEID_VALUE;
+
+    UA_ReadRequest request;
+    UA_ReadRequest_init(&request);
+    request.timestampsToReturn = UA_TIMESTAMPSTORETURN_NEITHER;
+    request.nodesToRead = &rvid;
+    request.nodesToReadSize = 1;
+
+    UA_ReadResponse response;
+    UA_ReadResponse_init(&response);
+
+    lockServer(server);
+    UA_Boolean done = Service_Read(server, &server->adminSession, &request, &response);
+    unlockServer(server);
+    ck_assert(!done);
+    ck_assert_ptr_nonnull(zombieReadPtr);
+
+    lockServer(server);
+    UA_Boolean waitingOpsEmpty = TAILQ_EMPTY(&server->asyncManager.waitingOps);
+    UA_AsyncOperation *op = waitingOpsEmpty ? NULL : TAILQ_FIRST(&server->asyncManager.waitingOps);
+    UA_AsyncResponse *ar = op ? op->handling.response : NULL;
+    UA_UInt32 opCountdownAfterCreate = ar ? ar->opCountdown : 0;
+    unlockServer(server);
+    ck_assert(!waitingOpsEmpty);
+    ck_assert_uint_eq(opCountdownAfterCreate, 1);
+
+    /* Arm the reentrant acknowledgement: the cancel callback will call
+     * UA_Server_setAsyncReadResult() on the very operation checkTimeouts()
+     * is in the middle of force-completing. */
+    completeCanceledRead = true;
+    completeCanceledReadResult = UA_STATUSCODE_BADUNEXPECTEDERROR;
+
+    /* Cross both the 50ms operation timeout and the 1s checkTimeouts tick
+     * in one go; a single iteration is enough to invoke it once. */
+    UA_fakeSleep(1100);
+    UA_Server_run_iterate(server, false);
+
+    /* The operation must already be unlinked before the callback runs, so
+     * the reentrant call finds nothing. */
+    ck_assert_uint_eq(completeCanceledReadResult, UA_STATUSCODE_BADNOTFOUND);
+
+    /* checkTimeouts() must then process the operation exactly once, so
+     * ar->opCountdown/opsCount reach exactly 0 -- not a wrapped-around
+     * unsigned underflow from being processed twice. */
+    lockServer(server);
+    UA_UInt32 opCountdownAfter = ar->opCountdown;
+    size_t opsCountAfter = server->asyncManager.opsCount;
+    unlockServer(server);
+    ck_assert_uint_eq(opCountdownAfter, 0);
+    ck_assert_uint_eq(opsCountAfter, 0);
+
+    config->asyncOperationTimeout = oldTimeout;
+
+    running = true;
+    THREAD_CREATE(server_thread, serverloop);
+} END_TEST
+
 /* --- Suite registration --- */
 
 static Suite* method_async_suite(void) {
@@ -1890,6 +2438,20 @@ static Suite* method_async_suite(void) {
     tcase_add_test(tc_manager, Async_zombie_request_sent_then_lateAck);
     tcase_add_test(tc_manager, Async_zombie_request_leftover_at_shutdown);
 #endif
+    /* Additional zombie-tracking coverage: gaps found in review */
+    tcase_add_test(tc_manager, Async_zombie_directOp_syncCancel);
+    tcase_add_test(tc_manager, Async_zombie_sessionCancel);
+    tcase_add_test(tc_manager, Async_zombie_queueOverflow);
+    tcase_add_test(tc_manager, Async_forceCompleted_doesNotDeliverLateWorkerWrite);
+    /* Supplementary only -- does not gate pass/fail, see the note on this
+     * test. Kept in the suite so it's easy to build/run under a race
+     * detector, not because a plain run of it means anything. */
+    tcase_add_test(tc_manager, Async_stress_workerWriteVsResultConsumption);
+    /* Must stay last: on unpatched code this aborts the whole process
+     * during its own teardown (see the comment on the test), and this
+     * suite runs CK_NOFORK, so nothing registered after it would get a
+     * chance to report. */
+    tcase_add_test(tc_manager, Async_reentrantCancelDuringTimeout_isSafe);
     suite_add_tcase(s, tc_manager);
 
     return s;
