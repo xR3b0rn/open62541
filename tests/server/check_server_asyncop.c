@@ -2241,7 +2241,11 @@ THREAD_CALLBACK(raceWorkerLoop) {
     for(UA_UInt32 counter = 0; counter < 20000; counter++) {
         UA_Variant_setScalarCopy(&raceOpPtr->value, &counter, &UA_TYPES[UA_TYPES_UINT32]);
     }
+#ifdef UA_ARCHITECTURE_WIN32
+    return 0;
+#else
     return NULL;
+#endif
 }
 
 static void
