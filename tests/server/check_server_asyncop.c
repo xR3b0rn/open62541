@@ -2077,25 +2077,44 @@ START_TEST(Async_zombie_queueOverflow) {
     unlockServer(server);
 
     ck_assert_ptr_nonnull(zombieReadPtrB);
-    ck_assert(response.results[0].hasStatus);
-    ck_assert_uint_eq(response.results[0].status, UA_STATUSCODE_BADTOOMANYOPERATIONS);
 
     /* A service must not report *done* while one of its operations is
      * still outstanding from the worker's point of view -- the same way
      * any other force-cancelled-but-not-yet-acknowledged operation keeps
-     * its response pending. That in turn means the shared allocation must
-     * not be handed back to the caller and cleared synchronously here. */
+     * its response pending. */
     ck_assert(!done);
 
+    /* persistAsyncResponse() therefore took ownership of response's
+     * payload (moved it into the persisted UA_AsyncResponse) exactly like
+     * for any other not-yet-done response -- the local response is now
+     * empty, and the shared allocation was NOT handed back to the caller
+     * to clear synchronously. */
+    ck_assert_ptr_null(response.results);
+
+    /* The operation's force-completed status can't be read from
+     * zombieReadPtrB (the dedicated worker buffer, still possibly
+     * worker-owned) -- it was written directly into the actual response
+     * slot instead (see UA_AsyncOperation_cancel()'s READ_REQUEST case),
+     * which is exactly what the zombie's responseSlot.read now points to. */
     lockServer(server);
-    UA_Boolean zombieOpsEmpty = TAILQ_EMPTY(&server->asyncManager.zombieOps);
+    UA_AsyncOperation *zombieOpB = NULL, *cur;
+    TAILQ_FOREACH(cur, &server->asyncManager.zombieOps, pointers) {
+        if(cur->output.read == zombieReadPtrB) {
+            zombieOpB = cur;
+            break;
+        }
+    }
+    UA_StatusCode slotStatus = zombieOpB ? zombieOpB->responseSlot.read->status : UA_STATUSCODE_GOOD;
     unlockServer(server);
-    ck_assert(!zombieOpsEmpty);
+    ck_assert_ptr_nonnull(zombieOpB);
+    ck_assert_uint_eq(slotStatus, UA_STATUSCODE_BADTOOMANYOPERATIONS);
 
-    UA_ReadResponse_clear(&response);
+    UA_ReadResponse_clear(&response); /* no-op: response is already empty */
 
-    /* Clean up op A (by design never resolved above) instead of leaving it
-     * to the forced shutdown path. */
+    /* Clean up op A and the now-persisted, ready response for op B (by
+     * design never resolved above) instead of leaving them to the forced
+     * shutdown path. */
+    UA_Server_setAsyncReadResult(server, zombieReadPtrB);
     UA_Server_setAsyncReadResult(server, zombieReadPtr);
     UA_Server_run_iterate(server, false);
     UA_Server_run_iterate(server, false);

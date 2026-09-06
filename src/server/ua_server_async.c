@@ -11,16 +11,28 @@
 #include "ua_server_internal.h"
 
 /* The layout of the results array is:
- * [results-array] | padding | UA_AsyncResponse | padding | [UA_AsyncOperation]
+ * [results-array] | padding | UA_AsyncResponse | padding |
+ * [UA_AsyncOperation-array] | padding | [worker-buffer-array]
+ *
+ * The worker-buffer-array reserves one resultsType-sized slot per
+ * operation. For READ/CALL requests, this is the dedicated buffer handed
+ * to a still-pending operation's worker (see UA_AsyncOperation::output /
+ * responseSlot) -- kept separate from the results-array itself so a
+ * worker can safely own its slot until UA_Server_setAsync*Result(), with
+ * no risk of racing directOpCallback()/sendAsyncResponse() reading the
+ * response concurrently. Reserved but unused for WRITE, where there is no
+ * such race (UA_Server_setAsyncWriteResult() always writes the result
+ * itself, under the lock) -- kept uniform here for simplicity.
  *
  * We need to take care about memory alignment (padding). */
 static void *
 allocateResultsArray(const UA_DataType *resultsType, size_t resultsLen,
-                     UA_AsyncResponse **resp, UA_AsyncOperation **ops) {
+                     UA_AsyncResponse **resp, UA_AsyncOperation **ops,
+                     void **workerBufs) {
     const size_t padding = sizeof(size_t) - 1;
-    const size_t fixedSize = sizeof(UA_AsyncResponse) + 2 * padding;
+    const size_t fixedSize = sizeof(UA_AsyncResponse) + 3 * padding;
     const size_t elementSize =
-        resultsType->memSize + sizeof(UA_AsyncOperation);
+        2 * resultsType->memSize + sizeof(UA_AsyncOperation);
 
     /* Reserve the maximum padding at both alignment boundaries. */
     if(resultsLen > (SIZE_MAX - fixedSize) / elementSize)
@@ -30,8 +42,10 @@ allocateResultsArray(const UA_DataType *resultsType, size_t resultsLen,
         (resultsType->memSize * resultsLen + padding) & ~padding;
     size_t opsBegin =
         (responseBegin + sizeof(UA_AsyncResponse) + padding) & ~padding;
+    size_t workerBufsBegin =
+        (opsBegin + sizeof(UA_AsyncOperation) * resultsLen + padding) & ~padding;
     size_t allocationSize =
-        opsBegin + sizeof(UA_AsyncOperation) * resultsLen;
+        workerBufsBegin + resultsType->memSize * resultsLen;
 
     void *arr = UA_calloc(1, allocationSize);
     if(!arr)
@@ -39,6 +53,7 @@ allocateResultsArray(const UA_DataType *resultsType, size_t resultsLen,
     uintptr_t arrMem = (uintptr_t)arr;
     *resp = (UA_AsyncResponse*)(arrMem + responseBegin);
     *ops = (UA_AsyncOperation*)(arrMem + opsBegin);
+    *workerBufs = (void*)(arrMem + workerBufsBegin);
     return arr;
 }
 
@@ -49,17 +64,15 @@ UA_AsyncOperation_cancel(UA_Server *server, UA_AsyncOperation *op,
     UA_ServerConfig *sc = &server->config;
     void *cancelPtr = NULL;
 
-    /* Set the status and get the pointer that identifies the operation */
     switch(op->asyncOperationType) {
     case UA_ASYNCOPERATIONTYPE_READ_REQUEST:
         cancelPtr = op->output.read;
-        op->output.read->hasStatus = true;
-        op->output.read->status = opstatus;
+        op->responseSlot.read->hasStatus = true;
+        op->responseSlot.read->status = opstatus;
         break;
     case UA_ASYNCOPERATIONTYPE_READ_DIRECT:
         cancelPtr = &op->output.directRead;
-        op->output.directRead.hasStatus = true;
-        op->output.directRead.status = opstatus;
+        op->cancelStatus = opstatus;
         break;
     case UA_ASYNCOPERATIONTYPE_WRITE_REQUEST:
         cancelPtr = &op->context.writeValue.value;
@@ -70,14 +83,12 @@ UA_AsyncOperation_cancel(UA_Server *server, UA_AsyncOperation *op,
         op->output.directWrite = opstatus;
         break;
     case UA_ASYNCOPERATIONTYPE_CALL_REQUEST:
-        /* outputArguments is always an allocated pointer, also if the length is zero */
         cancelPtr = op->output.call->outputArguments;
-        op->output.call->statusCode = opstatus;
+        op->responseSlot.call->statusCode = opstatus;
         break;
     case UA_ASYNCOPERATIONTYPE_CALL_DIRECT:
-        /* outputArguments is always an allocated pointer, also if the length is zero */
         cancelPtr = op->output.directCall.outputArguments;
-        op->output.directCall.statusCode = opstatus;
+        op->cancelStatus = opstatus;
         break;
     default: UA_assert(false); return;
     }
@@ -86,12 +97,6 @@ UA_AsyncOperation_cancel(UA_Server *server, UA_AsyncOperation *op,
     if(sc->asyncOperationCancelCallback)
         sc->asyncOperationCancelCallback(server, cancelPtr);
 
-    /* The operation is force-completed. The result is delivered right away
-     * (see processOperationResult / UA_AsyncManager_processReady). But the
-     * worker that owns the output memory may not have noticed the
-     * cancellation yet and could still be writing into it. So the memory
-     * itself is kept alive until the worker's belated call to
-     * UA_Server_setAsync*Result is caught and does the actual cleanup. */
     op->status = UA_ASYNCOPERATIONSTATUS_CANCELED_WAITING_FOR_WORKER;
 }
 
@@ -232,22 +237,41 @@ sendAsyncResponse(UA_Server *server, UA_AsyncResponse *ar) {
 
 static void
 directOpCallback(UA_Server *server, UA_AsyncOperation *op) {
+    UA_Boolean canceled =
+        (op->status == UA_ASYNCOPERATIONSTATUS_CANCELED_WAITING_FOR_WORKER);
+
     switch(op->asyncOperationType) {
-    case UA_ASYNCOPERATIONTYPE_READ_DIRECT:
-        op->handling.callback.method.read(server,
-                                          op->handling.callback.context,
-                                          &op->output.directRead);
+    case UA_ASYNCOPERATIONTYPE_READ_DIRECT: {
+        if(!canceled) {
+            op->handling.callback.method.read(server, op->handling.callback.context,
+                                              &op->output.directRead);
+            break;
+        }
+        UA_DataValue dummy;
+        UA_DataValue_init(&dummy);
+        dummy.hasStatus = true;
+        dummy.status = op->cancelStatus;
+        op->handling.callback.method.read(server, op->handling.callback.context,
+                                          &dummy);
         break;
+    }
     case UA_ASYNCOPERATIONTYPE_WRITE_DIRECT:
-        op->handling.callback.method.write(server,
-                                           op->handling.callback.context,
+        op->handling.callback.method.write(server, op->handling.callback.context,
                                            op->output.directWrite);
         break;
-    case UA_ASYNCOPERATIONTYPE_CALL_DIRECT:
-        op->handling.callback.method.call(server,
-                                          op->handling.callback.context,
-                                          &op->output.directCall);
+    case UA_ASYNCOPERATIONTYPE_CALL_DIRECT: {
+        if(!canceled) {
+            op->handling.callback.method.call(server, op->handling.callback.context,
+                                              &op->output.directCall);
+            break;
+        }
+        UA_CallMethodResult dummy;
+        UA_CallMethodResult_init(&dummy);
+        dummy.statusCode = op->cancelStatus;
+        op->handling.callback.method.call(server, op->handling.callback.context,
+                                          &dummy);
         break;
+    }
     default: UA_assert(false); break;
     }
 }
@@ -263,12 +287,7 @@ UA_AsyncManager_processReady(void *application /* UA_Server */,
     /* Reset the delayed callback */
     UA_atomic_store((UA_atomic(void*)*)&am->dc.callback, NULL);
 
-    /* Process ready direct operations. Always notify the original caller
-     * right away. Only free the memory if the worker already acknowledged
-     * the result (status == FINISHED). Otherwise the operation was
-     * force-completed (timeout/cancel) and the worker may still be writing
-     * into the output memory -- park it as a zombie until the worker's
-     * belated UA_Server_setAsync*Result call frees it. */
+    /* Process ready direct operations and free them */
     UA_AsyncOperation *op = NULL, *op_tmp = NULL;
     TAILQ_FOREACH_SAFE(op, &am->readyOps, pointers, op_tmp) {
         TAILQ_REMOVE(&am->readyOps, op, pointers);
@@ -281,17 +300,16 @@ UA_AsyncManager_processReady(void *application /* UA_Server */,
         }
     }
 
-    /* Send out ready responses. Only free the response memory right away if
-     * none of its operations are still waiting for a late worker
-     * acknowledgement -- otherwise park it as a zombie. */
+    /* Send out ready responses */
     UA_AsyncResponse *ar, *temp;
     TAILQ_FOREACH_SAFE(ar, &am->readyResponses, pointers, temp) {
         TAILQ_REMOVE(&am->readyResponses, ar, pointers);
         sendAsyncResponse(server, ar);
-        if(ar->zombieCount == 0)
+        if(ar->zombieCount == 0) {
             UA_AsyncResponse_delete(ar);
-        else
+        } else {
             TAILQ_INSERT_TAIL(&am->zombieResponses, ar, pointers);
+        }
     }
 
     unlockServer(server);
@@ -350,6 +368,51 @@ processOperationResult(UA_Server *server, UA_AsyncOperation *op) {
     processReadyLater(server);
 }
 
+/* Force-complete an operation that has ALREADY been unlinked from
+ * am->waitingOps by the caller. UA_AsyncOperation_cancel() invokes the
+ * user's cancellation callback, which may reenter the server (e.g. a
+ * worker racing the cancellation calling UA_Server_setAsync*Result from
+ * inside the callback) -- unlinking first ensures a reentrant call cannot
+ * find and process the same operation again, matching the discipline
+ * cancelAsyncResponseOperations() and UA_AsyncManager_cancelSession()
+ * already use. This then finishes the bookkeeping that
+ * processOperationResult() does for a still-linked operation, specialized
+ * for the fact that this operation is always force-completed (so, for a
+ * request-backed operation, always ends up a zombie -- unlike
+ * processOperationResult(), which also handles genuine, non-cancelled
+ * completions). */
+static void
+finishCanceledOp(UA_Server *server, UA_AsyncOperation *op, UA_StatusCode status) {
+    UA_AsyncManager *am = &server->asyncManager;
+
+    UA_AsyncOperation_cancel(server, op, status);
+
+    if(op->asyncOperationType >= UA_ASYNCOPERATIONTYPE_CALL_DIRECT) {
+        /* Direct operation. Delivered (and, if genuinely finished by then,
+         * freed) by UA_AsyncManager_processReady(). */
+        TAILQ_INSERT_TAIL(&am->readyOps, op, pointers);
+        processReadyLater(server);
+        return;
+    }
+
+    /* Part of a service request. Its memory is shared with (part of) the
+     * UA_AsyncResponse, so it cannot be freed on its own -- keep it
+     * findable in zombieOps until the worker's belated
+     * UA_Server_setAsync*Result call. */
+    UA_AsyncResponse *ar = op->handling.response;
+    ar->zombieCount++;
+    TAILQ_INSERT_TAIL(&am->zombieOps, op, pointers);
+
+    am->opsCount--;
+    ar->opCountdown -= 1;
+    if(ar->opCountdown > 0)
+        return;
+
+    TAILQ_REMOVE(&am->waitingResponses, ar, pointers);
+    TAILQ_INSERT_TAIL(&am->readyResponses, ar, pointers);
+    processReadyLater(server);
+}
+
 /* Check if any operations have timed out */
 static void
 checkTimeouts(UA_Server *server, void *_) {
@@ -363,7 +426,9 @@ checkTimeouts(UA_Server *server, void *_) {
     UA_AsyncManager *am = &server->asyncManager;
     const UA_DateTime tNow = el->dateTime_nowMonotonic(el);
 
-    /* Loop over the waiting ops */
+    /* Unlink all timed-out operations first -- see finishCanceledOp(). */
+    TAILQ_HEAD(, UA_AsyncOperation) timedOutOps;
+    TAILQ_INIT(&timedOutOps);
     UA_AsyncOperation *op = NULL, *op_tmp = NULL;
     TAILQ_FOREACH_SAFE(op, &am->waitingOps, pointers, op_tmp) {
         /* Check the timeout */
@@ -374,13 +439,19 @@ checkTimeouts(UA_Server *server, void *_) {
             if(tNow <= op->handling.callback.timeout)
                 continue;
         }
+        TAILQ_REMOVE(&am->waitingOps, op, pointers);
+        TAILQ_INSERT_TAIL(&timedOutOps, op, pointers);
+    }
 
+    while((op = TAILQ_FIRST(&timedOutOps))) {
+        TAILQ_REMOVE(&timedOutOps, op, pointers);
+        /* TAILQ_REMOVE does not clear the links in release builds. Avoid
+         * retaining the stack-local queue head across the callback. */
+        op->pointers.tqe_next = NULL;
+        op->pointers.tqe_prev = NULL;
         UA_LOG_WARNING(server->config.logging, UA_LOGCATEGORY_SERVER,
                        "Operation was removed due to a timeout");
-
-        /* Mark operation as timed out integrate */
-        UA_AsyncOperation_cancel(server, op, UA_STATUSCODE_BADTIMEOUT);
-        processOperationResult(server, op);
+        finishCanceledOp(server, op, UA_STATUSCODE_BADTIMEOUT);
     }
 
     unlockServer(server);
@@ -423,12 +494,20 @@ void
 UA_AsyncManager_clear(UA_AsyncManager *am, UA_Server *server) {
     UA_LOCK_ASSERT(&server->serviceMutex);
 
-    /* Cancel all operations. This moves all operations and responses into the
-     * ready state. */
+    /* Cancel all operations. This moves all operations and responses into
+     * the ready state. Unlink everything first -- see finishCanceledOp(). */
+    TAILQ_HEAD(, UA_AsyncOperation) canceledOps;
+    TAILQ_INIT(&canceledOps);
     UA_AsyncOperation *op, *op_tmp;
     TAILQ_FOREACH_SAFE(op, &am->waitingOps, pointers, op_tmp) {
-        UA_AsyncOperation_cancel(server, op, UA_STATUSCODE_BADSHUTDOWN);
-        processOperationResult(server, op);
+        TAILQ_REMOVE(&am->waitingOps, op, pointers);
+        TAILQ_INSERT_TAIL(&canceledOps, op, pointers);
+    }
+    while((op = TAILQ_FIRST(&canceledOps))) {
+        TAILQ_REMOVE(&canceledOps, op, pointers);
+        op->pointers.tqe_next = NULL;
+        op->pointers.tqe_prev = NULL;
+        finishCanceledOp(server, op, UA_STATUSCODE_BADSHUTDOWN);
     }
 
     /* This sends out/notifies and removes all direct operations and async requests */
@@ -446,10 +525,17 @@ UA_AsyncManager_clear(UA_AsyncManager *am, UA_Server *server) {
     TAILQ_FOREACH_SAFE(op, &am->zombieOps, pointers, op_tmp) {
         TAILQ_REMOVE(&am->zombieOps, op, pointers);
         /* Request-type operations share memory with their UA_AsyncResponse
-         * and are freed together with it below. */
+         * and are freed together with it below -- but READ/CALL's
+         * dedicated worker buffer (see UA_AsyncOperation::output) may
+         * still hold nested data (e.g. a UA_Variant's array buffer) that
+         * nothing else will free; see finalizeZombieOp(). */
         if(op->asyncOperationType >= UA_ASYNCOPERATIONTYPE_CALL_DIRECT) {
             am->opsCount--;
             UA_AsyncOperation_delete(op);
+        } else if(op->asyncOperationType == UA_ASYNCOPERATIONTYPE_READ_REQUEST) {
+            UA_DataValue_clear(op->output.read);
+        } else if(op->asyncOperationType == UA_ASYNCOPERATIONTYPE_CALL_REQUEST) {
+            UA_CallMethodResult_clear(op->output.call);
         }
     }
     UA_AsyncResponse *ar, *ar_tmp;
@@ -500,6 +586,19 @@ UA_AsyncManager_cancelSession(UA_Server *server, const UA_NodeId *sessionId,
         op->pointers.tqe_next = NULL;
         op->pointers.tqe_prev = NULL;
         UA_AsyncOperation_cancel(server, op, status);
+
+        /* The operation is now CANCELED_WAITING_FOR_WORKER -- park it as a
+         * zombie exactly like finishCanceledOp()/processOperationResult()
+         * do, since its memory is shared with (part of) its
+         * UA_AsyncResponse and a worker that has not yet noticed the
+         * cancellation may still be writing into it. Safe to do
+         * unconditionally here (unlike at the point an operation first
+         * goes async): ar is already fully persisted and, from here on,
+         * reachable only through the async manager itself -- never
+         * through a synchronous caller about to free it. */
+        UA_AsyncResponse *canceledAr = op->handling.response;
+        canceledAr->zombieCount++;
+        TAILQ_INSERT_TAIL(&am->zombieOps, op, pointers);
     }
 
     UA_Boolean responseReady = false;
@@ -516,11 +615,13 @@ UA_AsyncManager_cancelSession(UA_Server *server, const UA_NodeId *sessionId,
 UA_UInt32
 UA_AsyncManager_cancel(UA_Server *server, UA_Session *session, UA_UInt32 requestHandle) {
     UA_LOCK_ASSERT(&server->serviceMutex);
+    UA_AsyncManager *am = &server->asyncManager;
 
-    /* Loop over all waiting operations */
+    /* Unlink all matching operations first -- see finishCanceledOp(). */
+    TAILQ_HEAD(, UA_AsyncOperation) canceledOps;
+    TAILQ_INIT(&canceledOps);
     UA_UInt32 count = 0;
     UA_AsyncOperation *op, *op_tmp;
-    UA_AsyncManager *am = &server->asyncManager;
     TAILQ_FOREACH_SAFE(op, &am->waitingOps, pointers, op_tmp) {
         /* Only request operations own a handling.response. */
         if(op->asyncOperationType >= UA_ASYNCOPERATIONTYPE_CALL_DIRECT)
@@ -536,9 +637,15 @@ UA_AsyncManager_cancel(UA_Server *server, UA_Session *session, UA_UInt32 request
         ar->response.callResponse.responseHeader.serviceResult =
             UA_STATUSCODE_BADREQUESTCANCELLEDBYCLIENT;
 
-        /* Notify, set operation status and integrate */
-        UA_AsyncOperation_cancel(server, op, UA_STATUSCODE_BADOPERATIONABANDONED);
-        processOperationResult(server, op);
+        TAILQ_REMOVE(&am->waitingOps, op, pointers);
+        TAILQ_INSERT_TAIL(&canceledOps, op, pointers);
+    }
+
+    while((op = TAILQ_FIRST(&canceledOps))) {
+        TAILQ_REMOVE(&canceledOps, op, pointers);
+        op->pointers.tqe_next = NULL;
+        op->pointers.tqe_prev = NULL;
+        finishCanceledOp(server, op, UA_STATUSCODE_BADOPERATIONABANDONED);
     }
 
     return count;
@@ -590,18 +697,34 @@ persistAsyncResponse(UA_Server *server, UA_Session *session,
     memcpy(&ar->response, response, ar->responseType->memSize);
     UA_init(response, ar->responseType);
 
-    /* Enqueue the ar */
-    TAILQ_INSERT_TAIL(&am->waitingResponses, ar, pointers);
+    if(ar->opCountdown > 0) {
+        /* Enqueue the ar, waiting for its remaining operations. */
+        TAILQ_INSERT_TAIL(&am->waitingResponses, ar, pointers);
+        return;
+    }
+
+    /* Every operation already "completed" from opCountdown's point of view
+     * -- persistAsyncResponseOperation() force-completed one at the queue
+     * limit without ever counting it there, and it was the only/last
+     * operation of this request. ar->zombieCount > 0 (the caller only
+     * persists here when opCountdown or zombieCount is nonzero) means it
+     * is not actually safe to hand the response back to the RPC caller and
+     * free it synchronously: a worker may still be writing into that
+     * force-completed operation's output memory. Go straight to
+     * readyResponses instead of waitingResponses, which would never be
+     * drained again since nothing will further decrement opCountdown. */
+    UA_assert(ar->zombieCount > 0);
+    TAILQ_INSERT_TAIL(&am->readyResponses, ar, pointers);
+    processReadyLater(server);
 }
 
 static void
 persistAsyncResponseOperation(UA_Server *server, UA_AsyncOperation *op,
-                              UA_AsyncOperationType opType, UA_AsyncResponse *ar,
-                              void *outputPtr) {
-    /* Set up the async operation */
+                              UA_AsyncOperationType opType, UA_AsyncResponse *ar) {
+    /* op->output (and, for READ_REQUEST/CALL_REQUEST, op->responseSlot)
+     * must already be set up by the caller. */
     op->asyncOperationType = opType;
     op->handling.response = ar;
-    op->output.read = (UA_DataValue*)outputPtr;
 
     /* Not enough resources to store the async operation */
     UA_AsyncManager *am = &server->asyncManager;
@@ -610,9 +733,19 @@ persistAsyncResponseOperation(UA_Server *server, UA_AsyncOperation *op,
         UA_LOG_WARNING(server->config.logging, UA_LOGCATEGORY_SERVER,
                        "Cannot create async operation: Queue exceeds limit (%d).",
                        (int unsigned)server->config.maxAsyncOperationQueueSize);
-        /* No need to call processOperationResult or UA_AsyncOperation_delete
-         * here. The response already has the status code integrated. */
+        /* The operation's callback (Operation_Read() et al., called before
+         * this) has already run and may have handed the output pointer to
+         * a worker that has not yet noticed there is no room left for it.
+         * Park it as a zombie exactly like every other force-completed
+         * operation, instead of leaving nothing behind to catch that late
+         * worker report. Do NOT count it in ar->opCountdown -- it never
+         * made it into the queue as a "normal" pending operation -- but the
+         * caller (Service_Read() et al.) must still learn that the
+         * response is not actually done yet from the worker's point of
+         * view; see persistAsyncResponse()'s ar->zombieCount handling. */
         UA_AsyncOperation_cancel(server, op, UA_STATUSCODE_BADTOOMANYOPERATIONS);
+        ar->zombieCount++;
+        TAILQ_INSERT_TAIL(&am->zombieOps, op, pointers);
         return;
     }
 
@@ -678,8 +811,18 @@ persistAsyncDirectOperation(UA_Server *server, UA_AsyncOperation *op,
         UA_LOG_WARNING(server->config.logging, UA_LOGCATEGORY_SERVER,
                        "Cannot create async operation: Queue exceeds limit (%d).",
                        (int unsigned)server->config.maxAsyncOperationQueueSize);
+        /* The operation's callback has already run (called before this) and
+         * may have handed the output pointer to a worker that has not yet
+         * noticed there is no room left for it. Park it as a zombie
+         * instead of deleting it out from under that worker -- like every
+         * other force-completed operation, its memory can only actually be
+         * freed once the worker's belated UA_Server_setAsync*Result call
+         * is caught. This op was never counted in opsCount yet (that only
+         * happens below, on the accepted path); count it now so
+         * finalizeZombieOp()'s later decrement stays balanced. */
         UA_AsyncOperation_cancel(server, op, UA_STATUSCODE_BADTOOMANYOPERATIONS);
-        UA_AsyncOperation_delete(op);
+        am->opsCount++;
+        TAILQ_INSERT_TAIL(&am->zombieOps, op, pointers);
         return UA_STATUSCODE_BADTOOMANYOPERATIONS;
     }
 
@@ -695,42 +838,68 @@ async_cancel(UA_Server *server, void *context, UA_StatusCode opstatus,
     UA_AsyncManager *am = &server->asyncManager;
     UA_AsyncOperation *op = NULL, *op_tmp = NULL;
 
-    /* Cancel operations that are still waiting for the result */
+    /* Unlink all matching waiting operations first -- see
+     * finishCanceledOp(); the same reentrancy hazard applies here. */
+    TAILQ_HEAD(, UA_AsyncOperation) canceledOps;
+    TAILQ_INIT(&canceledOps);
     TAILQ_FOREACH_SAFE(op, &am->waitingOps, pointers, op_tmp) {
         /* Only direct operations own a handling.callback. */
         if(op->asyncOperationType < UA_ASYNCOPERATIONTYPE_CALL_DIRECT)
             continue;
         if(op->handling.callback.context != context)
             continue;
+        TAILQ_REMOVE(&am->waitingOps, op, pointers);
+        TAILQ_INSERT_TAIL(&canceledOps, op, pointers);
+    }
+
+    UA_Boolean triggerReady = false;
+    while((op = TAILQ_FIRST(&canceledOps))) {
+        TAILQ_REMOVE(&canceledOps, op, pointers);
+        op->pointers.tqe_next = NULL;
+        op->pointers.tqe_prev = NULL;
 
         /* Cancel the operation. This sets the StatusCode and calls the
          * asyncOperationCancelCallback. */
         UA_AsyncOperation_cancel(server, op, opstatus);
 
-        /* Call the result-callback of the local async operation.
-         * Right away or in the next EventLoop iteration. */
+        /* Call the result-callback of the local async operation. Right
+         * away or in the next EventLoop iteration. Either way, the
+         * operation was just marked CANCELED_WAITING_FOR_WORKER above, so
+         * it must be parked as a zombie afterwards, exactly like the
+         * asynchronous variant -- a worker that has not yet noticed the
+         * cancellation may still be writing into its output memory,
+         * and only finalizeZombieOp() (triggered by that worker's belated
+         * UA_Server_setAsync*Result call) may actually free it. */
         if(cancelSynchronous) {
-            TAILQ_REMOVE(&am->waitingOps, op, pointers);
-            am->opsCount--;
             directOpCallback(server, op);
-            UA_AsyncOperation_delete(op);
+            TAILQ_INSERT_TAIL(&am->zombieOps, op, pointers);
         } else {
-            processOperationResult(server, op);
+            TAILQ_INSERT_TAIL(&am->readyOps, op, pointers);
+            triggerReady = true;
         }
     }
+    if(triggerReady)
+        processReadyLater(server);
 
     /* All "ready" operations get processed in the next EventLoop iteration anyway */
     if(!cancelSynchronous)
         return;
 
-    /* Process matching ready operations synchronously and delete them */
+    /* Process matching ready operations synchronously: notify the
+     * original caller right away, same as UA_AsyncManager_processReady()
+     * does, and only free the memory if the worker already acknowledged
+     * the result -- otherwise park it as a zombie the same way. */
     TAILQ_FOREACH_SAFE(op, &am->readyOps, pointers, op_tmp) {
         if(op->handling.callback.context != context)
             continue;
         TAILQ_REMOVE(&am->readyOps, op, pointers);
-        am->opsCount--;
         directOpCallback(server, op);
-        UA_AsyncOperation_delete(op);
+        if(op->status == UA_ASYNCOPERATIONSTATUS_FINISHED) {
+            am->opsCount--;
+            UA_AsyncOperation_delete(op);
+        } else {
+            TAILQ_INSERT_TAIL(&am->zombieOps, op, pointers);
+        }
     }
 }
 
@@ -757,8 +926,22 @@ finalizeZombieOp(UA_Server *server, UA_AsyncOperation *op) {
         return;
     }
 
-    /* Part of a service request. Only the whole UA_AsyncResponse (shared
-     * memory) can be freed -- and only once it has actually been sent. */
+    /* Part of a service request. The response was already sent with the
+     * cancellation status (written directly into responseSlot by
+     * UA_AsyncOperation_cancel()); this late report's actual value is
+     * moot, but for READ/CALL -- which own a dedicated worker buffer
+     * separate from the response -- any nested data it holds (e.g. a
+     * UA_Variant's array buffer) must still be freed here, since nothing
+     * else will. WRITE has no separate buffer (op->output.write aliases
+     * the response slot directly, see UA_AsyncOperation_cancel()) and a
+     * UA_StatusCode owns no nested data anyway. */
+    if(op->asyncOperationType == UA_ASYNCOPERATIONTYPE_READ_REQUEST)
+        UA_DataValue_clear(op->output.read);
+    else if(op->asyncOperationType == UA_ASYNCOPERATIONTYPE_CALL_REQUEST)
+        UA_CallMethodResult_clear(op->output.call);
+
+    /* Only the whole UA_AsyncResponse (shared memory) can be freed -- and
+     * only once it has actually been sent. */
     UA_AsyncResponse *ar = op->handling.response;
     UA_assert(ar->zombieCount > 0);
     ar->zombieCount--;
@@ -819,23 +1002,34 @@ Service_Read(UA_Server *server, UA_Session *session, const void *request_, void 
     /* Allocate the results array */
     UA_AsyncResponse *ar = NULL;
     UA_AsyncOperation *aopArray = NULL;
+    UA_DataValue *workerBufs = NULL;
     response->results = (UA_DataValue*)
         allocateResultsArray(&UA_TYPES[UA_TYPES_DATAVALUE],
-                             request->nodesToReadSize, &ar, &aopArray);
+                             request->nodesToReadSize, &ar, &aopArray,
+                             (void**)&workerBufs);
     if(!response->results) {
         response->responseHeader.serviceResult = UA_STATUSCODE_BADOUTOFMEMORY;
         return true;
     }
     response->resultsSize = request->nodesToReadSize;
 
-    /* Execute the operations */
+    /* Execute the operations. Operation_Read() writes into a dedicated
+     * worker-owned buffer, never directly into the response's results
+     * array -- see allocateResultsArray() / UA_AsyncOperation::output. */
     for(size_t i = 0; i < request->nodesToReadSize; i++) {
         UA_Boolean done = Operation_Read(server, session, request->timestampsToReturn,
-                                         &request->nodesToRead[i], &response->results[i]);
-        if(!done)
+                                         &request->nodesToRead[i], &workerBufs[i]);
+        if(done) {
+            /* Move the value into the actual response slot: a plain
+             * struct copy transferring ownership of any nested data. */
+            response->results[i] = workerBufs[i];
+            UA_DataValue_init(&workerBufs[i]);
+        } else {
+            aopArray[i].output.read = &workerBufs[i];
+            aopArray[i].responseSlot.read = &response->results[i];
             persistAsyncResponseOperation(server, &aopArray[i],
-                                          UA_ASYNCOPERATIONTYPE_READ_REQUEST,
-                                          ar, &response->results[i]);
+                                          UA_ASYNCOPERATIONTYPE_READ_REQUEST, ar);
+        }
         if(session->state == UA_SESSIONSTATE_CLOSED) {
             response->responseHeader.serviceResult = UA_STATUSCODE_BADSESSIONCLOSED;
             break;
@@ -846,11 +1040,11 @@ Service_Read(UA_Server *server, UA_Session *session, const void *request_, void 
      * not done */
     if(session->state == UA_SESSIONSTATE_CLOSED && ar->opCountdown > 0)
         cancelAsyncResponseOperations(server, ar, UA_STATUSCODE_BADSESSIONCLOSED);
-    if(ar->opCountdown > 0) {
+    if(ar->opCountdown > 0 || ar->zombieCount > 0) {
         ar->responseType = &UA_TYPES[UA_TYPES_READRESPONSE];
         persistAsyncResponse(server, session, response, ar);
     }
-    return (ar->opCountdown == 0);
+    return (ar->opCountdown == 0 && ar->zombieCount == 0);
 }
 
 static UA_StatusCode
@@ -935,6 +1129,13 @@ UA_Server_setAsyncReadResult(UA_Server *server, UA_DataValue *result) {
     UA_AsyncOperation *op = NULL;
     TAILQ_FOREACH(op, &am->waitingOps, pointers) {
         if(op->output.read == result || &op->output.directRead == result) {
+            if(op->asyncOperationType == UA_ASYNCOPERATIONTYPE_READ_REQUEST) {
+                /* Move the resolved value into the actual response slot,
+                 * transferring ownership of any nested data. The worker
+                 * buffer (result, == op->output.read) is now empty. */
+                *op->responseSlot.read = *result;
+                UA_DataValue_init(result);
+            }
             op->status = UA_ASYNCOPERATIONSTATUS_FINISHED;
             processOperationResult(server, op);
             break;
@@ -979,12 +1180,17 @@ Service_Write(UA_Server *server, UA_Session *session,
         return true;
     }
 
-    /* Allocate the results array */
+    /* Allocate the results array. No worker buffer is used for write --
+     * UA_Server_setAsyncWriteResult() always writes the result itself,
+     * under the lock, so there is no race to guard against here; see
+     * UA_AsyncOperation_cancel(). */
     UA_AsyncResponse *ar = NULL;
     UA_AsyncOperation *aopArray = NULL;
+    UA_StatusCode *unusedWorkerBufs = NULL;
     response->results = (UA_StatusCode*)
         allocateResultsArray(&UA_TYPES[UA_TYPES_STATUSCODE],
-                             request->nodesToWriteSize, &ar, &aopArray);
+                             request->nodesToWriteSize, &ar, &aopArray,
+                             (void**)&unusedWorkerBufs);
     if(!response->results) {
         response->responseHeader.serviceResult = UA_STATUSCODE_BADOUTOFMEMORY;
         return true;
@@ -1000,9 +1206,10 @@ Service_Write(UA_Server *server, UA_Session *session,
         aop->context.writeValue = request->nodesToWrite[i];
         UA_Boolean done = Operation_Write(server, session, &aop->context.writeValue,
                                           &response->results[i]);
-        if(!done)
-            persistAsyncResponseOperation(server, aop, UA_ASYNCOPERATIONTYPE_WRITE_REQUEST,
-                                          ar, &response->results[i]);
+        if(!done) {
+            aop->output.write = &response->results[i]; /* direct alias -- no race */
+            persistAsyncResponseOperation(server, aop, UA_ASYNCOPERATIONTYPE_WRITE_REQUEST, ar);
+        }
         if(session->state == UA_SESSIONSTATE_CLOSED) {
             response->responseHeader.serviceResult = UA_STATUSCODE_BADSESSIONCLOSED;
             break;
@@ -1013,11 +1220,11 @@ Service_Write(UA_Server *server, UA_Session *session,
      * not done */
     if(session->state == UA_SESSIONSTATE_CLOSED && ar->opCountdown > 0)
         cancelAsyncResponseOperations(server, ar, UA_STATUSCODE_BADSESSIONCLOSED);
-    if(ar->opCountdown > 0) {
+    if(ar->opCountdown > 0 || ar->zombieCount > 0) {
         ar->responseType = &UA_TYPES[UA_TYPES_WRITERESPONSE];
         persistAsyncResponse(server, session, response, ar);
     }
-    return (ar->opCountdown == 0);
+    return (ar->opCountdown == 0 && ar->zombieCount == 0);
 }
 
 static UA_StatusCode
@@ -1156,23 +1363,34 @@ Service_Call(UA_Server *server, UA_Session *session,
     /* Allocate the results array */
     UA_AsyncResponse *ar = NULL;
     UA_AsyncOperation *aopArray = NULL;
+    UA_CallMethodResult *workerBufs = NULL;
     response->results = (UA_CallMethodResult*)
         allocateResultsArray(&UA_TYPES[UA_TYPES_CALLMETHODRESULT],
-                             request->methodsToCallSize, &ar, &aopArray);
+                             request->methodsToCallSize, &ar, &aopArray,
+                             (void**)&workerBufs);
     if(!response->results) {
         response->responseHeader.serviceResult = UA_STATUSCODE_BADOUTOFMEMORY;
         return true;
     }
     response->resultsSize = request->methodsToCallSize;
 
-    /* Execute the operations */
+    /* Execute the operations. Operation_CallMethod() writes into a
+     * dedicated worker-owned buffer, never directly into the response's
+     * results array -- see allocateResultsArray() / UA_AsyncOperation::output. */
     for(size_t i = 0; i < request->methodsToCallSize; i++) {
         UA_Boolean done = Operation_CallMethod(server, session, &request->methodsToCall[i],
-                                               &response->results[i]);
-        if(!done)
+                                               &workerBufs[i]);
+        if(done) {
+            /* Move the value into the actual response slot: a plain
+             * struct copy transferring ownership of any nested data. */
+            response->results[i] = workerBufs[i];
+            UA_CallMethodResult_init(&workerBufs[i]);
+        } else {
+            aopArray[i].output.call = &workerBufs[i];
+            aopArray[i].responseSlot.call = &response->results[i];
             persistAsyncResponseOperation(server, &aopArray[i],
-                                          UA_ASYNCOPERATIONTYPE_CALL_REQUEST,
-                                          ar, &response->results[i]);
+                                          UA_ASYNCOPERATIONTYPE_CALL_REQUEST, ar);
+        }
         if(session->state == UA_SESSIONSTATE_CLOSED) {
             response->responseHeader.serviceResult = UA_STATUSCODE_BADSESSIONCLOSED;
             break;
@@ -1183,11 +1401,11 @@ Service_Call(UA_Server *server, UA_Session *session,
      * not done */
     if(session->state == UA_SESSIONSTATE_CLOSED && ar->opCountdown > 0)
         cancelAsyncResponseOperations(server, ar, UA_STATUSCODE_BADSESSIONCLOSED);
-    if(ar->opCountdown > 0) {
+    if(ar->opCountdown > 0 || ar->zombieCount > 0) {
         ar->responseType = &UA_TYPES[UA_TYPES_CALLRESPONSE];
         persistAsyncResponse(server, session, response, ar);
     }
-    return (ar->opCountdown == 0);
+    return (ar->opCountdown == 0 && ar->zombieCount == 0);
 }
 
 UA_StatusCode
@@ -1248,8 +1466,13 @@ UA_Server_setAsyncCallMethodResult(UA_Server *server, UA_Variant *output,
     TAILQ_FOREACH(op, &am->waitingOps, pointers) {
         if(op->asyncOperationType == UA_ASYNCOPERATIONTYPE_CALL_REQUEST) {
             if(op->output.call->outputArguments == output) {
-                op->status = UA_ASYNCOPERATIONSTATUS_FINISHED;
                 op->output.call->statusCode = result;
+                /* Move the resolved value into the actual response slot,
+                 * transferring ownership of the output arguments. The
+                 * worker buffer (op->output.call) is now empty. */
+                *op->responseSlot.call = *op->output.call;
+                UA_CallMethodResult_init(op->output.call);
+                op->status = UA_ASYNCOPERATIONSTATUS_FINISHED;
                 processOperationResult(server, op);
                 break;
             }

@@ -55,14 +55,6 @@ typedef enum {
 typedef enum {
     UA_ASYNCOPERATIONSTATUS_PENDING = 0,
     UA_ASYNCOPERATIONSTATUS_FINISHED = 1,
-
-    /* The operation was force-completed (timeout, cancel, shutdown) and the
-     * result (response / direct callback) has already been delivered. But
-     * the worker that owns the output memory has not yet acknowledged via
-     * UA_Server_setAsync*Result. The memory must stay alive (and findable)
-     * until that late acknowledgement arrives -- otherwise a worker that is
-     * still writing into the output pointer would race with the memory
-     * being freed. */
     UA_ASYNCOPERATIONSTATUS_CANCELED_WAITING_FOR_WORKER = 2,
 } UA_AsyncOperationStatus;
 
@@ -71,6 +63,8 @@ typedef struct UA_AsyncOperation {
     TAILQ_ENTRY(UA_AsyncOperation) pointers;
     UA_AsyncOperationType asyncOperationType;
     UA_AsyncOperationStatus status;
+
+    UA_StatusCode cancelStatus;
 
     union {
         /* The operation is part of a service request */
@@ -98,6 +92,16 @@ typedef struct UA_AsyncOperation {
         UA_StatusCode directWrite;
         UA_DataValue directRead;
     } output;
+
+    /* READ_REQUEST/CALL_REQUEST only: the actual slot in the response's
+     * results array. Holds a library-only placeholder value until the
+     * operation resolves, at which point either the worker's value (from
+     * output above) is moved here, or -- if force-completed first -- the
+     * cancellation status is written here directly. */
+    union {
+        UA_CallMethodResult *call;
+        UA_DataValue *read;
+    } responseSlot;
 
     union {
         /* Forward the pointer to writeValue to the operationCallback. So the
